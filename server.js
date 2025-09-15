@@ -1,4 +1,3 @@
-
 const express = require('express');
 const session = require('express-session');
 const SQLiteStore = require('connect-sqlite3')(session);
@@ -100,16 +99,16 @@ app.use((req, res, next) => {
     const { table, column } = USER_LOOKUP;
     const row = db.prepare(`SELECT session_id FROM ${table} WHERE ${column} = ?`).get(req.session.usuario);
     if (row?.session_id && row.session_id !== req.sessionID) {
-  // Esta sesión ha sido reemplazada desde otro dispositivo
-  const cookieOpts = { path: '/', httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' };
-  const kick = () => {
-    try { res.clearCookie('connect.sid', cookieOpts); } catch {}
-    res.set('Cache-Control', 'no-store');
-    if (req.path === '/verificar-sesion') return res.sendStatus(401);
-    return res.redirect('/login.html?error=sesion');
-  };
-  return req.session.destroy(kick);
-}
+      // Esta sesión ha sido reemplazada desde otro dispositivo
+      const cookieOpts = { path: '/', httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' };
+      const kick = () => {
+        try { res.clearCookie('connect.sid', cookieOpts); } catch (e) {}
+        res.set('Cache-Control', 'no-store');
+        if (req.path === '/verificar-sesion') return res.sendStatus(401);
+        return res.redirect('/login.html?error=sesion');
+      };
+      return req.session.destroy(kick);
+    }
     next();
   } catch (e) {
     console.error('Middleware sesión única:', e);
@@ -153,7 +152,31 @@ app.post('/login', (req, res) => {
           return res.redirect('/login.html?error=server');
         }
         req.session.usuario = row.username;
+        try {
+          db.prepare(`UPDATE ${table} SET session_id = ? WHERE ${column} = ?`)
+            .run(req.sessionID, row.username);
+        } catch (e) {
+          console.error('❌ Error actualizando session_id:', e);
+          return res.redirect('/login.html?error=server');
+        }
+        req.session.save(() => res.redirect('/'));
+      });
+    };
 
+    // Si había una sesión previa, destruirla y continuar
+    if (row.session_id && row.session_id !== req.sessionID) {
+      sessionStore.destroy(row.session_id, (err) => {
+        if (err) console.warn('No se pudo destruir la sesión previa:', err);
+        proceed();
+      });
+    } else {
+      proceed();
+    }
+  } catch (e) {
+    console.error('❌ Error en /login:', e);
+    return res.redirect('/login.html?error=server');
+  }
+});
 
 // --- Logout: limpiar marca de sesión ---
 app.get('/logout', (req, res) => {
@@ -172,8 +195,6 @@ app.get('/logout', (req, res) => {
 app.get('/verificar-sesion', (req, res) => {
   res.json({ activo: !!req.session.usuario });
 });
-
-
 
 // --- Healthcheck ---
 app.get('/health', (_req, res) => res.status(200).send('ok'));
