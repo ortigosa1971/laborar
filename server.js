@@ -145,29 +145,15 @@ app.post('/login', (req, res) => {
 
     if (!row) return res.redirect('/login.html?error=credenciales');
 
-    // ¿Existe una sesión previa distinta?
-    if (row.session_id && row.session_id !== req.sessionID) {
-      // Opción B (recomendada): INVALIDAR la anterior y continuar
-      sessionStore.destroy(row.session_id, (err) => {
-        if (err) console.warn('No se pudo destruir la sesión previa:', err);
-        // Rotar SID y vincular (prevención de fixation)
-        return req.session.regenerate((err) => {
-          if (err) {
-            console.error('❌ Error regenerando sesión:', err);
-            return res.redirect('/login.html?error=server');
-          }
-          req.session.usuario = row.username;
-          try {
-            db.prepare(`UPDATE ${table} SET session_id = ? WHERE ${column} = ?`).run(req.sessionID, row.username);
-          } catch (e) {
-            console.error('❌ Error actualizando session_id:', e);
-            return res.redirect('/login.html?error=server');
-          }
-          req.session.save(() => res.redirect('/'));
-        });
-      });redirect('/login.html?error=server');
-  }
-});
+    // función para crear/vincular la sesión actual y guardar en BD
+    const proceed = () => {
+      req.session.regenerate((err) => {
+        if (err) {
+          console.error('❌ Error regenerando sesión:', err);
+          return res.redirect('/login.html?error=server');
+        }
+        req.session.usuario = row.username;
+
 
 // --- Logout: limpiar marca de sesión ---
 app.get('/logout', (req, res) => {
