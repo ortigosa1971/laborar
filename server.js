@@ -1,19 +1,23 @@
-
-// server.js
+// server.js (parcheado: /health público, raíz '/', acepta 'usuario' o 'username')
 const express = require('express');
 const session = require('express-session');
 const SQLiteStore = require('connect-sqlite3')(session);
 const path = require('path');
+const fs = require('fs');
 const Database = require('better-sqlite3');
 const util = require('util');
 
 const app = express();
 app.set('trust proxy', 1);
 
+// ====== Carpetas ======
+const DB_DIR = path.join(__dirname, 'db');
+if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
+
 // ====== Sesiones (SQLite) ======
 const store = new SQLiteStore({
   db: 'sessions.sqlite',
-  dir: path.join(__dirname, 'db')
+  dir: DB_DIR
 });
 
 app.use(session({
@@ -38,7 +42,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ====== DB (usuarios) ======
-const db = new Database(path.join(__dirname, 'db', 'usuarios.db'));
+const db = new Database(path.join(DB_DIR, 'usuarios.db'));
 db.pragma('journal_mode = wal');
 
 // Asegura la tabla (si no existe)
@@ -58,13 +62,24 @@ function autenticar(username, password) {
   return row; // { username, password, session_id }
 }
 
+// ====== Healthcheck (PUBLICO) ======
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
+// ====== Raíz (PUBLICO) ======
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'login.html'));
+});
+
 // ====== Login: bloquear segundos inicios de sesión ======
 app.post('/login', async (req, res) => {
   try {
-    const { usuario, password } = req.body;
-    if (!usuario) return res.redirect('/login.html?error=credenciales');
+    const { usuario, username, password } = req.body;     // acepta 'usuario' o 'username'
+    const userField = usuario || username;
+    if (!userField) return res.redirect('/login.html?error=credenciales');
 
-    const user = autenticar(usuario, password);
+    const user = autenticar(userField, password);
     if (!user) return res.redirect('/login.html?error=credenciales');
 
     // ¿Tiene sesión registrada?
@@ -166,6 +181,7 @@ app.post('/admin/forzar-logout', async (req, res) => {
 
 // ====== Arranque ======
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Servidor en http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor en http://0.0.0.0:${PORT}`));
+
 
 
