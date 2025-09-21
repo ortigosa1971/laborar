@@ -43,7 +43,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // --- Session store reutilizable (para poder destruir sesiones previas) ---
 const sessionStore = new SQLiteStore({
-  db: 'sessions.db',
+  db: 'sessions.db', ttl: 3600,
   dir: path.dirname(DB_PATH),
 });
 
@@ -54,8 +54,7 @@ app.use(session({
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    sameSite: 'lax',
-    maxAge: 1000 * 60 * 60 * 6 // 6 horas
+    sameSite: 'lax'
   }
 }));
 
@@ -203,3 +202,4 @@ app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.use((req, res) => res.status(404).send('Página no encontrada'));
 
 app.listen(PORT, () => console.log(`🚀 Servidor corriendo en el puerto ${PORT}`));
+
