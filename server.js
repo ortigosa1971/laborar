@@ -1,205 +1,169 @@
+
+// server.js
 const express = require('express');
 const session = require('express-session');
 const SQLiteStore = require('connect-sqlite3')(session);
 const path = require('path');
-const fs = require('fs');
-const cors = require('cors');
 const Database = require('better-sqlite3');
-require('dotenv').config();
+const util = require('util');
 
 const app = express();
-app.set('trust proxy', 1); // detrás de proxy (Railway)
-const PORT = process.env.PORT || 8080;
+app.set('trust proxy', 1);
 
-const DEFAULT_DB = path.join(__dirname, 'db', 'usuarios.db');
-const DB_PATH = process.env.DB_PATH || DEFAULT_DB;
-
-// --- Preparar base de datos en disco ---
-try {
-  const targetDir = path.dirname(DB_PATH);
-  if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
-  if (!fs.existsSync(DB_PATH) && fs.existsSync(DEFAULT_DB)) {
-    fs.copyFileSync(DEFAULT_DB, DB_PATH);
-    console.log(`📦 Copiada base de datos a ${DB_PATH}`);
-  }
-} catch (e) {
-  console.warn('No se pudo preparar la DB:', e?.message || e);
-}
-
-// --- Conexión SQLite ---
-let db;
-try {
-  db = new Database(DB_PATH);
-  console.log(`🗄️  Conectado a SQLite en: ${DB_PATH}`);
-} catch (e) {
-  console.error('Error abriendo la base de datos:', e);
-  process.exit(1);
-}
-
-app.use(cors());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-// --- Session store reutilizable (para poder destruir sesiones previas) ---
-const sessionStore = new SQLiteStore({
-  db: 'sessions.db', ttl: 3600,
-  dir: path.dirname(DB_PATH),
+// ====== Sesiones (SQLite) ======
+const store = new SQLiteStore({
+  db: 'sessions.sqlite',
+  dir: path.join(__dirname, 'db')
 });
 
 app.use(session({
-  store: sessionStore,
-  secret: process.env.SESSION_SECRET || 'clave-secreta',
+  store,
+  secret: process.env.SESSION_SECRET || 'clave-secreta-cámbiame',
   resave: false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    sameSite: 'lax'
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 1000 * 60 * 60 * 8 // 8 horas
   }
 }));
 
-// --- Utilidades para detectar tabla/columna de usuarios ---
-function resolveUserLookup(db) {
-  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name);
-  const tableCandidates = ["users", "usuarios"];
-  const columnCandidates = ["username", "usuario", "nombre"];
-  for (const t of tableCandidates) {
-    if (!tables.includes(t)) continue;
-    const cols = db.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
-    const hit = columnCandidates.find(c => cols.includes(c));
-    if (hit) return { table: t, column: hit };
-  }
-  return null;
+// Promesas para usar store.get/destroy cómodamente
+const storeGet = util.promisify(store.get).bind(store);
+const storeDestroy = util.promisify(store.destroy).bind(store);
+
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ====== DB (usuarios) ======
+const db = new Database(path.join(__dirname, 'db', 'usuarios.db'));
+db.pragma('journal_mode = wal');
+
+// Asegura la tabla (si no existe)
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password TEXT,
+    session_id TEXT
+  )
+`).run();
+
+// ====== Helper: autenticar (ajusta a tu lógica real) ======
+function autenticar(username, password) {
+  const row = db.prepare('SELECT username, password, session_id FROM users WHERE username = ?').get(username);
+  if (!row) return null;
+  if (row.password && password && row.password !== password) return null;
+  return row; // { username, password, session_id }
 }
 
-// Resolver al arrancar (y cachear)
-let USER_LOOKUP = null;
-try {
-  USER_LOOKUP = resolveUserLookup(db);
-  if (!USER_LOOKUP) {
-    console.error("❌ No se encontró tabla/columna de usuarios válida. Revisa tu BD.");
-  } else {
-    console.log(`✅ Login usando tabla '${USER_LOOKUP.table}', columna '${USER_LOOKUP.column}'`);
-    // Asegurar columna session_id
-    const cols = db.prepare(`PRAGMA table_info(${USER_LOOKUP.table})`).all().map(c => c.name);
-    if (!cols.includes('session_id')) {
-      db.prepare(`ALTER TABLE ${USER_LOOKUP.table} ADD COLUMN session_id TEXT`).run();
-      console.log(`🛠️ Añadida columna session_id en ${USER_LOOKUP.table}`);
-    }
-  }
-} catch (e) {
-  console.error("❌ Error resolviendo esquema de usuarios:", e);
-}
-
-// --- Middleware: sesión única ---
-app.use((req, res, next) => {
+// ====== Login: bloquear segundos inicios de sesión ======
+app.post('/login', async (req, res) => {
   try {
-    if (!req.session?.usuario || !USER_LOOKUP) return next();
-    const { table, column } = USER_LOOKUP;
-    const row = db.prepare(`SELECT session_id FROM ${table} WHERE ${column} = ?`).get(req.session.usuario);
-    if (row?.session_id && row.session_id !== req.sessionID) {
-      // Esta sesión ha sido reemplazada desde otro dispositivo
-      const cookieOpts = { path: '/', httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' };
-      const kick = () => {
-        try { res.clearCookie('connect.sid', cookieOpts); } catch (e) {}
-        res.set('Cache-Control', 'no-store');
-        if (req.path === '/verificar-sesion') return res.sendStatus(401);
-        return res.redirect('/login.html?error=sesion');
-      };
-      return req.session.destroy(kick);
+    const { usuario, password } = req.body;
+    if (!usuario) return res.redirect('/login.html?error=credenciales');
+
+    const user = autenticar(usuario, password);
+    if (!user) return res.redirect('/login.html?error=credenciales');
+
+    // ¿Tiene sesión registrada?
+    if (user.session_id) {
+      // ¿Sigue viva en el store?
+      const sess = await storeGet(user.session_id);
+      if (sess) {
+        // Sesión ACTIVA: rechazamos este nuevo login
+        return res.redirect('/login.html?error=sesion_activa');
+      }
+      // Si no existe en store (expirada/limpiada): liberamos el campo
+      db.prepare('UPDATE users SET session_id = NULL WHERE username = ?').run(user.username);
     }
-    next();
+
+    // Crea sesión para este dispositivo
+    req.session.usuario = user.username;
+
+    // Guarda el session_id vivo en la tabla users
+    db.prepare('UPDATE users SET session_id = ? WHERE username = ?').run(req.sessionID, user.username);
+
+    return res.redirect('/inicio.html');
   } catch (e) {
-    console.error('Middleware sesión única:', e);
-    next();
+    console.error(e);
+    return res.redirect('/login.html?error=interno');
   }
 });
 
-// --- Inicio (protegido) ---
-app.get('/', (req, res) => {
-  if (!req.session.usuario) return res.redirect('/login.html');
+// ====== Middleware: exigir sesión y única por usuario ======
+async function requiereSesionUnica(req, res, next) {
+  try {
+    if (!req.session?.usuario) return res.redirect('/login.html');
+
+    const user = db.prepare('SELECT session_id FROM users WHERE username = ?').get(req.session.usuario);
+    if (!user) return res.redirect('/login.html');
+
+    if (!user.session_id) {
+      req.session.destroy(() => res.redirect('/login.html?error=sesion_invalida'));
+      return;
+    }
+
+    if (user.session_id !== req.sessionID) {
+      req.session.destroy(() => res.redirect('/login.html?error=conectado_en_otra_maquina'));
+      return;
+    }
+
+    const sess = await storeGet(user.session_id);
+    if (!sess) {
+      db.prepare('UPDATE users SET session_id = NULL WHERE username = ?').run(req.session.usuario);
+      req.session.destroy(() => res.redirect('/login.html?error=sesion_expirada'));
+      return;
+    }
+
+    next();
+  } catch (e) {
+    console.error(e);
+    res.redirect('/login.html?error=interno');
+  }
+}
+
+// ====== Endpoints protegidos ======
+app.get('/inicio', requiereSesionUnica, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'inicio.html'));
 });
 
-// --- LOGIN con autodetección + reemplazo de sesión previa ---
-app.post('/login', (req, res) => {
-  try {
-    let { usuario } = req.body;
-    usuario = (usuario || '').trim();
-    if (!usuario) return res.redirect('/login.html?error=campos');
+app.get('/api/datos', requiereSesionUnica, (req, res) => {
+  res.json({ ok: true, usuario: req.session.usuario });
+});
 
-    if (!USER_LOOKUP) {
-      USER_LOOKUP = resolveUserLookup(db);
-      if (!USER_LOOKUP) {
-        console.error("❌ Esquema no válido: no hay tabla/columna de usuarios.");
-        return res.redirect('/login.html?error=server');
+app.get('/verificar-sesion', (req, res) => {
+  res.json({ activo: !!req.session?.usuario });
+});
+
+// ====== Logout ======
+app.post('/logout', (req, res) => {
+  const usuario = req.session?.usuario;
+  const sid = req.sessionID;
+
+  req.session.destroy(async () => {
+    if (usuario) {
+      const row = db.prepare('SELECT session_id FROM users WHERE username = ?').get(usuario);
+      if (row?.session_id === sid) {
+        db.prepare('UPDATE users SET session_id = NULL WHERE username = ?').run(usuario);
       }
     }
+    res.redirect('/login.html?msg=logout');
+  });
+});
 
-    const { table, column } = USER_LOOKUP;
-    const row = db.prepare(
-      `SELECT ${column} AS username, session_id FROM ${table} WHERE ${column} = ? LIMIT 1`
-    ).get(usuario);
-
-    if (!row) return res.redirect('/login.html?error=credenciales');
-
-    // función para crear/vincular la sesión actual y guardar en BD
-    const proceed = () => {
-      req.session.regenerate((err) => {
-        if (err) {
-          console.error('❌ Error regenerando sesión:', err);
-          return res.redirect('/login.html?error=server');
-        }
-        req.session.usuario = row.username;
-        try {
-          db.prepare(`UPDATE ${table} SET session_id = ? WHERE ${column} = ?`)
-            .run(req.sessionID, row.username);
-        } catch (e) {
-          console.error('❌ Error actualizando session_id:', e);
-          return res.redirect('/login.html?error=server');
-        }
-        req.session.save(() => res.redirect('/'));
-      });
-    };
-
-    // Si había una sesión previa, destruirla y continuar
-    if (row.session_id && row.session_id !== req.sessionID) {
-      sessionStore.destroy(row.session_id, (err) => {
-        if (err) console.warn('No se pudo destruir la sesión previa:', err);
-        proceed();
-      });
-    } else {
-      proceed();
-    }
-  } catch (e) {
-    console.error('❌ Error en /login:', e);
-    return res.redirect('/login.html?error=server');
+// ====== Admin: forzar logout ======
+app.post('/admin/forzar-logout', async (req, res) => {
+  const { username } = req.body;
+  const row = db.prepare('SELECT session_id FROM users WHERE username = ?').get(username);
+  if (row?.session_id) {
+    await storeDestroy(row.session_id).catch(() => {});
+    db.prepare('UPDATE users SET session_id = NULL WHERE username = ?').run(username);
   }
+  res.json({ ok: true });
 });
 
-// --- Logout: limpiar marca de sesión ---
-app.get('/logout', (req, res) => {
-  try {
-    if (req.session?.usuario && USER_LOOKUP) {
-      const { table, column } = USER_LOOKUP;
-      db.prepare(`UPDATE ${table} SET session_id = NULL WHERE ${column} = ?`).run(req.session.usuario);
-    }
-  } catch (e) {
-    console.warn('No se pudo limpiar session_id en logout:', e);
-  }
-  req.session.destroy(() => res.redirect('/login.html'));
-});
-
-// --- Utilidad para el frontend ---
-app.get('/verificar-sesion', (req, res) => {
-  res.json({ activo: !!req.session.usuario });
-});
-
-// --- Healthcheck ---
-app.get('/health', (_req, res) => res.status(200).send('ok'));
-
-// --- 404 ---
-app.use((req, res) => res.status(404).send('Página no encontrada'));
-
-app.listen(PORT, () => console.log(`🚀 Servidor corriendo en el puerto ${PORT}`));
-
+// ====== Arranque ======
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`🚀 Servidor en http://localhost:${PORT}`));
