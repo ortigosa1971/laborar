@@ -8,7 +8,22 @@ const fs = require('fs');
 const Database = require('better-sqlite3');
 const util = require('util');
 
-const app = express();
+\1
+
+/*__GLOBAL_GUARD__*/
+function __hasSession(req){
+  try { return !!(req.session && (req.session.userId || req.session.usuario || req.session.uid)); }
+  catch { return false; }
+}
+app.use((req, res, next) => {
+  const protegido = /^\/inicio(\/|$)|^\/api\//i.test(req.path);
+  if (protegido && !__hasSession(req)) {
+    return res.redirect('/login.html');
+  }
+  next();
+});
+/*__GLOBAL_GUARD_END__*/
+
 app.set('trust proxy', 1);
 
 // ====== Carpetas ======
@@ -44,7 +59,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.get('/inicio.html', (req, res) => res.redirect('/inicio'));
 
-app.use(express.static(PUBLIC_DIR));
+app.use(express.static(PUBLIC_DIR, { index: false }));
 
 // ====== DB usuarios ======
 const db = new Database(path.join(DB_DIR, 'usuarios.db'));
@@ -207,6 +222,12 @@ app.post('/admin/forzar-logout', async (req, res) => {
 // ====== Arranque ======
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 http://0.0.0.0:${PORT} — reemplazo automático de sesión activado`));
+
+
+
+
+
+
 
 
 
