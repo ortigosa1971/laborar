@@ -1,227 +1,114 @@
-// server.js — sesión única, reemplaza sesión anterior automáticamente, con claim atómico
-// Listo para Railway: incluye /health y raíz '/'
-const express = require('express');
-const session = require('express-session');
-const SQLiteStore = require('connect-sqlite3')(session);
-const path = require('path');
-const fs = require('fs');
-const Database = require('better-sqlite3');
-const util = require('util');
+// server.js — Express + sesiones, login y /inicio protegido (listo para Railway)
+import express from 'express';
+import path from 'path';
+import cookieParser from 'cookie-parser';
+import session from 'express-session';
+import compression from 'compression';
+import helmet from 'helmet';
+import { fileURLToPath } from 'url';
 
-\1
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-/*__GLOBAL_GUARD__*/
-function __hasSession(req){
-  try { return !!(req.session && (req.session.userId || req.session.usuario || req.session.uid)); }
-  catch { return false; }
-}
-app.use((req, res, next) => {
-  const protegido = /^\/inicio(\/|$)|^\/api\//i.test(req.path);
-  if (protegido && !__hasSession(req)) {
-    return res.redirect('/login.html');
-  }
-  next();
-});
-/*__GLOBAL_GUARD_END__*/
+const app = express();
 
-app.set('trust proxy', 1);
+// ---------- Seguridad / básicos ----------
+app.set('trust proxy', 1); // necesario en Railway para cookies 'secure'
+app.use(helmet({
+  contentSecurityPolicy: false, // desactiva CSP por simplicidad; ajústalo si lo necesitas
+}));
+app.use(compression());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
 
-// ====== Carpetas ======
-const DB_DIR = path.join(__dirname, 'db');
-if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
-const PUBLIC_DIR = path.join(__dirname, 'public');
-
-// ====== Sesiones (SQLite) ======
-const store = new SQLiteStore({
-  db: 'sessions.sqlite',
-  dir: DB_DIR
-});
-
+// ---------- Sesión ----------
+const SESSION_SECRET = process.env.SESSION_SECRET || 'cambia-esto-por-un-secreto-fuerte';
 app.use(session({
-  store,
-  secret: process.env.SESSION_SECRET || 'cambia-esta-clave',
+  secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    sameSite: process.env.SAMESITE || 'lax', // 'none' si front/back en dominios distintos (+ secure:true)
-    secure: process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production',
-    maxAge: 1000 * 60 * 60 * 8
-  }
+    secure: process.env.NODE_ENV === 'production', // en Railway es true
+    sameSite: 'lax',
+    maxAge: 1000 * 60 * 60 * 8, // 8h
+  },
 }));
 
-// Promesas para store.get/destroy
-const storeGet = util.promisify(store.get).bind(store);
-const storeDestroy = util.promisify(store.destroy).bind(store);
-
-// Body y estáticos
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+// ---------- Archivos estáticos públicos ----------
+// ¡NO pongas views/inicio.html aquí! Evita servir un index por defecto.
 app.get('/inicio.html', (req, res) => res.redirect('/inicio'));
+app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 
-app.use(express.static(PUBLIC_DIR, { index: false }));
-
-// ====== DB usuarios ======
-const db = new Database(path.join(DB_DIR, 'usuarios.db'));
-db.pragma('journal_mode = wal');
-db.prepare(`
-  CREATE TABLE IF NOT EXISTS users (
-    username TEXT PRIMARY KEY,
-    password TEXT,
-    session_id TEXT
-  )
-`).run();
-
-const DEBUG = process.env.DEBUG_SINGLE_SESSION === '1';
-const log = (...a) => DEBUG && console.log('[single-session]', ...a);
-
-// ====== Healthcheck (PUBLICO) ======
-app.get('/health', (req, res) => res.status(200).send('OK'));
-
-// ====== Raíz (PUBLICO) ======
-app.get('/', (req, res) => {
-  const loginFile = path.join(PUBLIC_DIR, 'login.html');
-  if (fs.existsSync(loginFile)) return res.sendFile(loginFile);
-  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><title>Login</title></head>
-  <body>
-    <h1>Login</h1>
-    <form method="POST" action="/login">
-      <input name="usuario" placeholder="usuario" required>
-      <input type="password" name="password" placeholder="password" required>
-      <button>Entrar</button>
-    </form>
-  </body></html>`);
-});
-
-// ====== Helper: autenticar (ajusta a tu lógica real) ======
-function autenticar(username, password) {
-  const row = db.prepare('SELECT username, password, session_id FROM users WHERE username = ?').get(username);
-  if (!row) return null;
-  if (row.password && password && row.password !== password) return null;
-  return row;
+// ---------- Guardia global para rutas protegidas ----------
+function hasSession(req) {
+  return !!(req.session && req.session.user);
 }
-
-// ====== LOGIN: reemplaza SIEMPRE la sesión anterior + claim atómico ======
-app.post('/login', async (req, res) => {
-  try {
-    const { usuario, username, password } = req.body;
-    const userField = usuario || username;
-    if (!userField) return res.redirect('/login.html?error=credenciales');
-
-    const user = autenticar(userField, password);
-    if (!user) return res.redirect('/login.html?error=credenciales');
-
-    // 1) Si había una sesión previa, EXPULSARLA SIEMPRE (reemplazo automático)
-    if (user.session_id) {
-      await storeDestroy(user.session_id).catch(() => {}); // ignora error si ya expiró
-      db.prepare('UPDATE users SET session_id = NULL WHERE username = ?').run(user.username);
-    }
-
-    // 2) Regenerar sesión para nuevo SID (evita fijación y choques)
-    await new Promise((resolve, reject) => {
-      req.session.regenerate(err => (err ? reject(err) : resolve()));
-    });
-
-    // 3) Claim ATÓMICO: tomar la sesión solo si sigue NULL
-    const claim = db.prepare(
-      'UPDATE users SET session_id = ? WHERE username = ? AND session_id IS NULL'
-    ).run(req.sessionID, user.username);
-
-    if (claim.changes === 0) {
-      // Alguna carrera extrema: otro proceso tomó la sesión en microsegundos
-      return res.redirect('/login.html?error=sesion_activa');
-    }
-
-    // 4) Completar sesión de app
-    req.session.usuario = user.username;
-    log('login OK (reemplazo + claim) para', user.username, 'sid:', req.sessionID);
-    return res.redirect('/inicio');
-  } catch (e) {
-    console.error(e);
-    return res.redirect('/login.html?error=interno');
+app.use((req, res, next) => {
+  const protegido = /^\/inicio(\/|$)/i.test(req.path) || (/^\/api\//i.test(req.path) && !/^\/api\/(login|salud)/i.test(req.path));
+  if (protegido && !hasSession(req)) {
+    // Si es API, responde 401; si no, redirige a /login
+    if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'unauthorized' });
+    return res.redirect('/login');
   }
+  next();
 });
 
-// ====== Middleware: sesión única ======
-async function requiereSesionUnica(req, res, next) {
-  try {
-    if (!req.session?.usuario) return res.redirect('/login.html');
+// ---------- Login / Logout ----------
+app.get('/login', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'login.html'));
+});
 
-    const row = db.prepare('SELECT session_id FROM users WHERE username = ?').get(req.session.usuario);
-    if (!row) return res.redirect('/login.html');
+// Usuario demo (sobrescribible por variables de entorno)
+const DEMO_USER = process.env.DEMO_USER || 'prueba';
+const DEMO_PASS = process.env.DEMO_PASS || '1234';
 
-    if (!row.session_id) {
-      req.session.destroy(() => res.redirect('/login.html?error=sesion_invalida'));
-      return;
-    }
-
-    if (row.session_id !== req.sessionID) {
-      req.session.destroy(() => res.redirect('/login.html?error=conectado_en_otra_maquina'));
-      return;
-    }
-
-    const sess = await storeGet(row.session_id);
-    if (!sess) {
-      db.prepare('UPDATE users SET session_id = NULL WHERE username = ?').run(req.session.usuario);
-      req.session.destroy(() => res.redirect('/login.html?error=sesion_expirada'));
-      return;
-    }
-
-    next();
-  } catch (e) {
-    console.error(e);
-    res.redirect('/login.html?error=interno');
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body || {};
+  if (username === DEMO_USER && password === DEMO_PASS) {
+    req.session.user = { username };
+    return res.redirect('/inicio'); // siempre a la ruta protegida
   }
-}
-
-// ====== Rutas protegidas ======
-app.get('/inicio', requiereSesionUnica, (req, res) => {
-  const inicioFile = path.join(PUBLIC_DIR, 'inicio.html');
-  if (fs.existsSync(inicioFile)) return res.sendFile(inicioFile);
-  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><title>Inicio</title></head>
-  <body><h1>Inicio</h1><p>Usuario: ${req.session.usuario}</p>
-  <form method="POST" action="/logout"><button>Salir</button></form>
-  </body></html>`);
+  return res.status(401).send('Usuario o contraseña incorrectos');
 });
 
-app.get('/api/datos', requiereSesionUnica, (req, res) => {
-  res.json({ ok: true, usuario: req.session.usuario, sid: req.sessionID });
-});
-
-app.get('/verificar-sesion', (req, res) => {
-  res.json({ activo: !!req.session?.usuario });
-});
-
-// ====== Logout ======
-app.post('/logout', (req, res) => {
-  const usuario = req.session?.usuario;
-  const sid = req.sessionID;
-
-  req.session.destroy(async () => {
-    if (usuario) {
-      const row = db.prepare('SELECT session_id FROM users WHERE username = ?').get(usuario);
-      if (row?.session_id === sid) {
-        db.prepare('UPDATE users SET session_id = NULL WHERE username = ?').run(usuario);
-      }
-    }
-    res.redirect('/login.html?msg=logout');
+app.post('/api/logout', (req, res) => {
+  req.session.destroy(() => {
+    res.clearCookie('connect.sid');
+    res.redirect('/login');
   });
 });
 
-// ====== Admin: forzar logout (opcional) ======
-app.post('/admin/forzar-logout', async (req, res) => {
-  const { username } = req.body;
-  const row = db.prepare('SELECT session_id FROM users WHERE username = ?').get(username);
-  if (row?.session_id) {
-    await storeDestroy(row.session_id).catch(() => {});
-    db.prepare('UPDATE users SET session_id = NULL WHERE username = ?').run(username);
-  }
-  res.json({ ok: true });
+// ---------- Rutas protegidas ----------
+app.get('/inicio', (req, res) => {
+  // Cabeceras anti-caché
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.sendFile(path.join(__dirname, 'views', 'inicio.html'));
 });
 
-// ====== Arranque ======
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 http://0.0.0.0:${PORT} — reemplazo automático de sesión activado`));
+app.get('/api/me', (req, res) => {
+  res.json({ user: req.session.user });
+});
+
+// (Ejemplo) API de datos protegida
+app.get('/api/datos', (req, res) => {
+  res.json({ ok: true, msg: 'Solo con sesión', ts: Date.now() });
+});
+
+// ---------- Healthcheck Railway ----------
+app.get('/salud', (req, res) => res.status(200).send('ok'));
+
+// ---------- Start ----------
+const PORT = process.env.PORT || 3000;
+const HOST = '0.0.0.0';
+app.listen(PORT, HOST, () => {
+  console.log(`✅ Servidor escuchando en http://${HOST}:${PORT}`);
+  console.log(`   DEMO_USER=${DEMO_USER} DEMO_PASS=${DEMO_PASS}`);
+});
+
 
 
 
