@@ -42,6 +42,8 @@ const storeDestroy = util.promisify(store.destroy).bind(store);
 // Body y estáticos
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+app.get('/inicio.html', (req, res) => res.redirect('/inicio'));
+
 app.use(express.static(PUBLIC_DIR));
 
 // ====== DB usuarios ======
@@ -118,7 +120,7 @@ app.post('/login', async (req, res) => {
     // 4) Completar sesión de app
     req.session.usuario = user.username;
     log('login OK (reemplazo + claim) para', user.username, 'sid:', req.sessionID);
-    return res.redirect('/inicio.html');
+    return res.redirect('/inicio');
   } catch (e) {
     console.error(e);
     return res.redirect('/login.html?error=interno');
@@ -205,6 +207,12 @@ app.post('/admin/forzar-logout', async (req, res) => {
 // ====== Arranque ======
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 http://0.0.0.0:${PORT} — reemplazo automático de sesión activado`));
+
+
+
+
+
+
 
 
 
