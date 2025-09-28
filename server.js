@@ -1,4 +1,4 @@
-// server.js — servidor mínimo, JSON seguro y healthcheck
+// server.js — servidor mínimo sin CSP para evitar bloqueos
 import express from 'express';
 import path from 'path';
 import cookieParser from 'cookie-parser';
@@ -12,14 +12,16 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// Middlewares básicos
-app.use(helmet());
+// Helmet SIN contentSecurityPolicy
+app.use(helmet({ contentSecurityPolicy: false }));
+
+// Otros middlewares
 app.use(compression());
 app.use(cookieParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Sesiones en memoria (simple para empezar)
+// Sesiones en memoria
 app.use(session({
   secret: process.env.SESSION_SECRET || 'dev-secret',
   resave: false,
@@ -27,31 +29,33 @@ app.use(session({
   cookie: { sameSite: 'lax' }
 }));
 
-// Estáticos
+// Archivos estáticos
 app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 
 // Healthcheck para Railway
 app.get('/salud', (req, res) => res.status(200).send('ok'));
 
-// Demo de usuario
+// Usuario demo
 const DEMO_USER = process.env.DEMO_USER || 'prueba';
 const DEMO_PASS = process.env.DEMO_PASS || '1234';
 
-// API: login JSON
+// API login → SIEMPRE responde JSON
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body || {};
   if (username === DEMO_USER && password === DEMO_PASS) {
     req.session.user = { username };
-    return res.status(200).json({ ok: true, redirect: '/inicio' });
+    return res.json({ ok: true, redirect: '/inicio' });
   }
   return res.status(401).json({ ok: false, error: 'Credenciales inválidas' });
 });
 
+// API usuario actual
 app.get('/api/me', (req, res) => {
   if (!req.session?.user) return res.status(401).json({ error: 'unauthorized' });
   res.json({ user: req.session.user });
 });
 
+// Páginas
 app.get('/login', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
@@ -64,8 +68,8 @@ app.get('/inicio', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'inicio.html'));
 });
 
+// Arrancar
 const PORT = process.env.PORT || 3000;
-const HOST = '0.0.0.0';
-app.listen(PORT, HOST, () => {
-  console.log(`✅ Servidor escuchando en http://${HOST}:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Servidor escuchando en http://localhost:${PORT}`);
 });
