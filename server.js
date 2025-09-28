@@ -1,4 +1,4 @@
-// server.js — servidor mínimo sin CSP para evitar bloqueos
+// server.js — servidor mínimo con redirección raíz y sin CSP para evitar bloqueos
 import express from 'express';
 import path from 'path';
 import cookieParser from 'cookie-parser';
@@ -12,7 +12,7 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// Helmet SIN contentSecurityPolicy
+// Helmet SIN contentSecurityPolicy (para evitar errores CSP)
 app.use(helmet({ contentSecurityPolicy: false }));
 
 // Otros middlewares
@@ -35,6 +35,11 @@ app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 // Healthcheck para Railway
 app.get('/salud', (req, res) => res.status(200).send('ok'));
 
+// 👇 NUEVO: redirigir raíz al login
+app.get('/', (req, res) => {
+  res.redirect('/login');
+});
+
 // Usuario demo
 const DEMO_USER = process.env.DEMO_USER || 'prueba';
 const DEMO_PASS = process.env.DEMO_PASS || '1234';
@@ -55,17 +60,23 @@ app.get('/api/me', (req, res) => {
   res.json({ user: req.session.user });
 });
 
-// Páginas
+// Página de login
 app.get('/login', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
 
+// Página de inicio (protegida)
 app.get('/inicio', (req, res) => {
   if (!req.session?.user) return res.redirect('/login');
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
   res.sendFile(path.join(__dirname, 'public', 'inicio.html'));
+});
+
+// 404 amigable (opcional)
+app.use((req, res) => {
+  res.status(404).send('Página no encontrada');
 });
 
 // Arrancar
